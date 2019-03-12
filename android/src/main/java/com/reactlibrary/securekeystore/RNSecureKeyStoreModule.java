@@ -22,10 +22,15 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.security.GeneralSecurityException;
+import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.security.Provider;
 import java.security.PublicKey;
+import java.security.Security;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.util.Calendar;
 import android.support.annotation.Nullable;
 import com.facebook.react.bridge.ReadableMap;
@@ -64,7 +69,7 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     }
   }
 
-  private PublicKey getOrCreatePublicKey(String alias) throws GeneralSecurityException, IOException {
+  private PublicKey getOrCreatePublicKey(String alias) throws Exception {
     KeyStore keyStore = KeyStore.getInstance(getKeyStore());
     keyStore.load(null);
 
@@ -75,16 +80,30 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
       Calendar end = Calendar.getInstance();
       end.add(Calendar.YEAR, 50);
       KeyPairGeneratorSpec spec = new KeyPairGeneratorSpec.Builder(getContext())
-          .setAlias(alias)
-          .setSubject(new X500Principal("CN=" + alias))
-          .setSerialNumber(BigInteger.ONE)
-          .setStartDate(start.getTime())
-          .setEndDate(end.getTime())
-          .build();
+              .setAlias(alias)
+              .setSubject(new X500Principal("CN=" + alias))
+              .setSerialNumber(BigInteger.ONE)
+              .setStartDate(start.getTime())
+              .setEndDate(end.getTime())
+              .build();
 
       KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", getKeyStore());
       generator.initialize(spec);
-      generator.generateKeyPair();
+
+      try {
+        if (WorkaroundHelper.isNotWorkaround(getContext())) {
+          generator.generateKeyPair();
+        } else {
+          createAndSaveCertificate(alias, keyStore, start, end);
+        }
+      } catch (Exception e) {
+        if (WorkaroundHelper.shouldEnableWorkaround(e)) {
+          createAndSaveCertificate(alias, keyStore, start, end);
+          WorkaroundHelper.enableWorkaround(getContext());
+        } else {
+          throw e;
+        }
+      }
 
       Log.i(Constants.TAG, "created new asymmetric keys for alias");
     }
@@ -93,7 +112,14 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
   }
 
   private byte[] encryptRsaPlainText(PublicKey publicKey, byte[] plainTextBytes) throws GeneralSecurityException, IOException {
-    Cipher cipher = Cipher.getInstance(Constants.RSA_ALGORITHM);
+    Cipher cipher;
+
+    if (WorkaroundHelper.isNotWorkaround(getContext())) {
+      cipher = Cipher.getInstance(Constants.RSA_ALGORITHM);
+    } else {
+      cipher = WorkaroundHelper.getCipher();
+    }
+
     cipher.init(Cipher.ENCRYPT_MODE, publicKey);
     return encryptCipherText(cipher, plainTextBytes);
   }
@@ -116,7 +142,7 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
     return outputStream.toByteArray();
   }
 
-  private SecretKey getOrCreateSecretKey(String alias) throws GeneralSecurityException, IOException {
+  private SecretKey getOrCreateSecretKey(String alias) throws Exception {
     try {
       return getSymmetricKey(alias);
     } catch (FileNotFoundException fnfe) {
@@ -128,16 +154,16 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
       SecretKey secretKey = keyGenerator.generateKey();
       PublicKey publicKey = getOrCreatePublicKey(alias);
       Storage.writeValues(getContext(), Constants.SKS_KEY_FILENAME + alias,
-          encryptRsaPlainText(publicKey, secretKey.getEncoded()));
+              encryptRsaPlainText(publicKey, secretKey.getEncoded()));
 
       Log.i(Constants.TAG, "created new symmetric keys for alias");
       return secretKey;
     }
   }
 
-  private void setCipherText(String alias, String input) throws GeneralSecurityException, IOException {
+  private void setCipherText(String alias, String input) throws Exception {
     Storage.writeValues(getContext(), Constants.SKS_DATA_FILENAME + alias,
-        encryptAesPlainText(getOrCreateSecretKey(alias), input));
+            encryptAesPlainText(getOrCreateSecretKey(alias), input));
   }
 
   @ReactMethod
@@ -161,7 +187,14 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
   }
 
   private byte[] decryptRsaCipherText(PrivateKey privateKey, byte[] cipherTextBytes) throws GeneralSecurityException, IOException {
-    Cipher cipher = Cipher.getInstance(Constants.RSA_ALGORITHM);
+    Cipher cipher;
+
+    if (WorkaroundHelper.isNotWorkaround(getContext())) {
+      cipher = Cipher.getInstance(Constants.RSA_ALGORITHM);
+    } else {
+      cipher = WorkaroundHelper.getCipher();
+    }
+
     cipher.init(Cipher.DECRYPT_MODE, privateKey);
     return decryptCipherText(cipher, cipherTextBytes);
   }
@@ -198,9 +231,9 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
 
   @ReactMethod
   public void remove(String alias, Promise promise) {
-    Storage.resetValues(getContext(), new String[] { 
-      Constants.SKS_DATA_FILENAME + alias, 
-      Constants.SKS_KEY_FILENAME + alias, 
+    Storage.resetValues(getContext(), new String[] {
+            Constants.SKS_DATA_FILENAME + alias,
+            Constants.SKS_KEY_FILENAME + alias,
     });
     promise.resolve("cleared alias");
   }
@@ -221,6 +254,22 @@ public class RNSecureKeyStoreModule extends ReactContextBaseJavaModule {
         return Constants.KEYSTORE_PROVIDER_3;
       }
     }
+  }
+
+  private void createAndSaveCertificate(String alias, KeyStore keyStore, Calendar start, Calendar end) throws Exception {
+    // Generate RSA-2048 key pair
+    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+    generator.initialize(2048);
+
+    KeyPair pair = generator.generateKeyPair();
+    PrivateKey privKey = pair.getPrivate();
+    PublicKey pubKey = pair.getPublic();
+
+    X509Certificate cert = WorkaroundHelper.buildX509Certificate(alias, start, end, privKey, pubKey);
+
+    // save keys in KeyStore
+    keyStore.setCertificateEntry(alias, cert);
+    keyStore.setKeyEntry(alias, privKey, "".toCharArray(), new Certificate[]{cert});
   }
 
 }
